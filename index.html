@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>P2P Ping Pong</title>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #0f172a;
+    color: #e2e8f0;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: 16px;
+  }
+  .app { width: 100%; max-width: 640px; text-align: center; }
+  h1 { font-size: 1.5rem; margin-bottom: 10px; }
+  .conn {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: .85rem; padding: 6px 14px; border-radius: 999px;
+    background: rgba(148,163,184,.12); color: #94a3b8; margin-bottom: 12px;
+  }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #eab308; }
+  .conn.connected .dot { background: #22c55e; }
+  .conn.disconnected .dot { background: #ef4444; }
+  button {
+    font: inherit; cursor: pointer; border: none; border-radius: 10px;
+    padding: 10px 18px; background: #6366f1; color: #fff; font-weight: 600;
+  }
+  button:hover:not(:disabled) { filter: brightness(1.15); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.secondary { background: #334155; }
+  #setup { margin-bottom: 12px; }
+  .link-box { display: none; gap: 8px; margin-top: 10px; }
+  .link-box.show { display: flex; }
+  .link-box input {
+    flex: 1; min-width: 0; padding: 10px; border-radius: 10px;
+    border: 1px solid #334155; background: #0b1220; color: #e2e8f0; font-size: .8rem;
+  }
+  #status { font-size: 1.1rem; font-weight: 600; min-height: 1.6em; margin-bottom: 10px; }
+  canvas {
+    width: 100%; aspect-ratio: 3 / 2; display: block;
+    background: #111c33; border-radius: 14px; touch-action: none;
+    box-shadow: 0 15px 40px rgba(0,0,0,.45); margin-bottom: 14px;
+  }
+  .hint { font-size: .8rem; color: #94a3b8; margin-top: 10px; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div class="app">
+  <h1>🏓 Ping Pong</h1>
+  <div id="conn" class="conn"><span class="dot"></span><span id="connText">Connecting...</span></div>
+
+  <div id="setup">
+    <button id="createBtn" disabled>Create Room</button>
+    <div id="linkBox" class="link-box">
+      <input id="linkInput" type="text" readonly>
+      <button id="copyBtn" class="secondary">Copy</button>
+    </div>
+  </div>
+
+  <div id="status">Connecting...</div>
+  <canvas id="c" width="600" height="400"></canvas>
+  <button id="restartBtn" disabled>Restart Game</button>
+  <div class="hint">Move mouse / finger over the board, or use ↑ ↓ / W S. First to 7 wins.</div>
+</div>
+
+<script>
+(() => {
+  const W = 600, H = 400;
+  const PW = 10, PH = 80, PAD_X = 20, R = 7, WIN = 7;
+  const $ = id => document.getElementById(id);
+  const canvas = $('c'), ctx = canvas.getContext('2d');
+  const connEl = $('conn'), connText = $('connText'), statusEl = $('status');
+  const createBtn = $('createBtn'), restartBtn = $('restartBtn');
+  const linkBox = $('linkBox'), linkInput = $('linkInput'), copyBtn = $('copyBtn'), setupEl = $('setup');
+
+  const roomParam = new URLSearchParams(location.search).get('room');
+  const isHost = !roomParam;           // host = left paddle, joiner = right paddle
+
+  let peer = null, conn = null, connected = false;
+
+  // Shared game state (host is authoritative; joiner mirrors it)
+  const S = {
+    ball: { x: W / 2, y: H / 2, vx: 0, vy: 0 },
+    p1: (H - PH) / 2,    // host paddle top y
+    p2: (H - PH) / 2,    // joiner paddle top y
+    s1: 0, s2: 0,
+    over: false, winner: 0,
+    serveTimer: 0
+  };
+
+  let myY = (H - PH) / 2;   // my local paddle position
+  let keyDir = 0;
+
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+  function setConn(cls, text) { connEl.className = 'conn ' + cls; connText.textContent = text; }
+  function send(d) { if (conn && conn.open) conn.send(d); }
+
+  // ---------- Host game logic ----------
+  function serve(dir) {
+    const b = S.ball;
+    b.x = W / 2; b.y = H / 2;
+    const a = (Math.random() * 0.8 - 0.4);
+    const sp = 300;
+    b.vx = Math.cos(a) * sp * dir;
+    b.vy = Math.sin(a) * sp;
+    S.serveTimer = 1;
+  }
+
+  function resetGame() {
+    S.s1 = S.s2 = 0; S.over = false; S.winner = 0;
+    serve(Math.random() < 0.5 ? 1 : -1);
+  }
+
+  function hitPaddle(py, dir) {
+    const b = S.ball;
+    const rel = (b.y - (py + PH / 2)) / (PH / 2);          // -1..1
+    const speed = Math.min(Math.hypot(b.vx, b.vy) * 1.06, 700);
+    const ang = rel * (Math.PI / 4);
+    b.vx = Math.cos(ang) * speed * dir;
+    b.vy = Math.sin(ang) * speed;
+  }
+
+  function step(dt) {
+    S.p1 = myY;                         // host paddle follows local input
+    if (S.over) return;
+    if (S.serveTimer > 0) { S.serveTimer -= dt; return; }
+    const b = S.ball;
+    b.x += b.vx * dt; b.y += b.vy * dt;
+
+    if (b.y < R) { b.y = R; b.vy = Math.abs(b.vy); }
+    if (b.y > H - R) { b.y = H - R; b.vy = -Math.abs(b.vy); }
+
+    // left paddle (host)
+    if (b.vx < 0 && b.x - R <= PAD_X + PW && b.x + R >= PAD_X &&
+        b.y >= S.p1 - R && b.y <= S.p1 + PH + R) {
+      b.x = PAD_X + PW + R; hitPaddle(S.p1, 1);
+    }
+    // right paddle (joiner)
+    if (b.vx > 0 && b.x + R >= W - PAD_X - PW && b.x - R <= W - PAD_X &&
+        b.y >= S.p2 - R && b.y <= S.p2 + PH + R) {
+      b.x = W - PAD_X - PW - R; hitPaddle(S.p2, -1);
+    }
+
+    // scoring
+    if (b.x < -R) { S.s2++; afterPoint(1); }
+    else if (b.x > W + R) { S.s1++; afterPoint(-1); }
+  }
+
+  function afterPoint(nextDir) {
+    if (S.s1 >= WIN || S.s2 >= WIN) {
+      S.over = true;
+      S.winner = S.s1 >= WIN ? 1 : 2;
+      S.ball.vx = S.ball.vy = 0;
+      S.ball.x = W / 2; S.ball.y = H / 2;
+    } else {
+      serve(nextDir);
+    }
+  }
+
+  // ---------- Rendering ----------
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+    ctx.strokeStyle = 'rgba(148,163,184,.35)';
+    ctx.setLineDash([10, 12]); ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(W / 2, 0); ctx.lineTo(W / 2, H); ctx.stroke();
+    ctx.setLineDash([]);
+
+    ctx.font = 'bold 48px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(226,232,240,.5)';
+    ctx.fillText(S.s1, W / 2 - 60, 62);
+    ctx.fillText(S.s2, W / 2 + 60, 62);
+
+    const p1y = isHost ? myY : S.p1;
+    const p2y = isHost ? S.p2 : myY;
+    ctx.fillStyle = '#38bdf8';
+    ctx.fillRect(PAD_X, p1y, PW, PH);
+    ctx.fillStyle = '#f472b6';
+    ctx.fillRect(W - PAD_X - PW, p2y, PW, PH);
+
+    if (connected) {
+      ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.arc(S.ball.x, S.ball.y, R, 0, Math.PI * 2); ctx.fill();
+    }
+    updateStatus();
+  }
+
+  function updateStatus() {
+    if (!connected) return;
+    const me = isHost ? 1 : 2;
+    if (S.over) {
+      statusEl.textContent = S.winner === me ? 'You Won! 🎉' : 'You Lost!';
+      statusEl.style.color = S.winner === me ? '#22c55e' : '#ef4444';
+    } else {
+      statusEl.textContent = `You: ${isHost ? S.s1 : S.s2}  —  Friend: ${isHost ? S.s2 : S.s1}`;
+      statusEl.style.color = '';
+    }
+  }
+
+  // ---------- Input ----------
+  function pointerY(e) {
+    const rect = canvas.getBoundingClientRect();
+    const t = e.touches ? e.touches[0] : e;
+    return (t.clientY - rect.top) * (H / rect.height);
+  }
+  function onPointer(e) {
+    myY = clamp(pointerY(e) - PH / 2, 0, H - PH);
+    if (e.cancelable) e.preventDefault();
+  }
+  canvas.addEventListener('mousemove', onPointer);
+  canvas.addEventListener('touchstart', onPointer, { passive: false });
+  canvas.addEventListener('touchmove', onPointer, { passive: false });
+  addEventListener('keydown', e => {
+    if (e.key === 'ArrowUp' || e.key === 'w' || e.key === 'W') keyDir = -1;
+    if (e.key === 'ArrowDown' || e.key === 's' || e.key === 'S') keyDir = 1;
+    if (['ArrowUp', 'ArrowDown'].includes(e.key)) e.preventDefault();
+  });
+  addEventListener('keyup', e => {
+    if (['ArrowUp', 'ArrowDown', 'w', 'W', 's', 'S'].includes(e.key)) keyDir = 0;
+  });
+
+  // ---------- Main loop ----------
+  let last = performance.now();
+  function loop(now) {
+    const dt = Math.min((now - last) / 1000, 0.05);
+    last = now;
+    if (keyDir) myY = clamp(myY + keyDir * 450 * dt, 0, H - PH);
+
+    if (connected) {
+      if (isHost) {
+        step(dt);
+        send({ type: 'STATE', b: S.ball, p1: S.p1, s1: S.s1, s2: S.s2, over: S.over, w: S.winner });
+      } else {
+        send({ type: 'PADDLE', y: myY });
+      }
+    }
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  // ---------- Networking ----------
+  function onData(d) {
+    if (!d || typeof d !== 'object') return;
+    if (d.type === 'PADDLE' && isHost) {
+      if (typeof d.y === 'number') S.p2 = clamp(d.y, 0, H - PH);
+    } else if (d.type === 'STATE' && !isHost) {
+      S.ball = d.b; S.p1 = d.p1; S.s1 = d.s1; S.s2 = d.s2; S.over = d.over; S.winner = d.w;
+    } else if (d.type === 'RESTART' && isHost) {
+      resetGame();
+    }
+  }
+
+  function setupConn(c) {
+    conn = c;
+    c.on('open', () => {
+      connected = true;
+      setConn('connected', 'Connected! Game Started');
+      setupEl.classList.add('hidden');
+      restartBtn.disabled = false;
+      if (isHost) resetGame();
+    });
+    c.on('data', onData);
+    const gone = () => {
+      connected = false;
+      setConn('disconnected', 'Peer Disconnected');
+      statusEl.textContent = 'Peer Disconnected';
+      statusEl.style.color = '#ef4444';
+      restartBtn.disabled = true;
+    };
+    c.on('close', gone);
+    c.on('error', gone);
+  }
+
+  function init() {
+    setConn('waiting', 'Connecting...');
+    peer = new Peer();
+    peer.on('open', id => {
+      if (!isHost) {
+        setupEl.classList.add('hidden');
+        setupConn(peer.connect(roomParam, { reliable: false }));
+        setTimeout(() => {
+          if (!connected) {
+            setConn('disconnected', 'Peer Disconnected');
+            statusEl.textContent = 'Could not reach host. Check the link.';
+          }
+        }, 15000);
+      } else {
+        createBtn.disabled = false;
+        setConn('waiting', 'Ready — create a room');
+        statusEl.textContent = 'Create a room to start';
+      }
+    });
+    peer.on('connection', c => {
+      if (!isHost) return;
+      if (conn && conn.open) { c.close(); return; }
+      setupConn(c);
+    });
+    peer.on('error', err => {
+      console.error(err);
+      if (!connected) {
+        setConn('disconnected', 'Peer Disconnected');
+        statusEl.textContent = err.type === 'peer-unavailable'
+          ? 'Room not found. The host may have left.' : 'Connection error: ' + err.type;
+      }
+    });
+  }
+
+  createBtn.addEventListener('click', () => {
+    const url = new URL(location.href);
+    url.search = ''; url.hash = '';
+    url.searchParams.set('room', peer.id);
+    linkInput.value = url.toString();
+    linkBox.classList.add('show');
+    createBtn.classList.add('hidden');
+    setConn('waiting', 'Waiting for Friend...');
+    statusEl.textContent = 'Share the link with a friend';
+  });
+
+  copyBtn.addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(linkInput.value); }
+    catch { linkInput.select(); document.execCommand('copy'); }
+    copyBtn.textContent = 'Copied!';
+    setTimeout(() => copyBtn.textContent = 'Copy', 1500);
+  });
+
+  restartBtn.addEventListener('click', () => {
+    if (!connected) return;
+    if (isHost) resetGame(); else send({ type: 'RESTART' });
+  });
+
+  init();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+  </html>
+  
